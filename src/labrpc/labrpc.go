@@ -59,12 +59,6 @@ import "math/rand"
 import "time"
 import "sync/atomic"
 
-const (
-	SHORTDELAY = 27   // ms
-	LONGDELAY  = 7000 // ms
-	MAXDELAY   = LONGDELAY + 100
-)
-
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
 	svcMeth  string      // e.g. "Raft.AppendEntries"
@@ -181,13 +175,6 @@ func (rn *Network) Reliable(yes bool) {
 	rn.reliable = yes
 }
 
-func (rn *Network) IsReliable() bool {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	return rn.reliable
-}
-
 func (rn *Network) LongReordering(yes bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -234,7 +221,7 @@ func (rn *Network) processReq(req reqMsg) {
 	if enabled && servername != nil && server != nil {
 		if reliable == false {
 			// short delay
-			ms := (rand.Int() % SHORTDELAY)
+			ms := (rand.Int() % 27)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
@@ -308,7 +295,7 @@ func (rn *Network) processReq(req reqMsg) {
 		if rn.longDelays {
 			// let Raft tests check that leader doesn't send
 			// RPCs synchronously.
-			ms = (rand.Int() % LONGDELAY)
+			ms = (rand.Int() % 7000)
 		} else {
 			// many kv tests require the client to try each
 			// server in fairly rapid succession.

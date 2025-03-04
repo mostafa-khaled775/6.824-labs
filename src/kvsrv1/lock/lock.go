@@ -30,35 +30,20 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 
 func (lk *Lock) Acquire() {
 	value, version, err := lk.ck.Get(lk.key)
-	if err == rpc.ErrNoKey {
-		if putErr := lk.ck.Put(lk.key, lk.value, 0); putErr != rpc.OK {
-			if putErr == rpc.ErrMaybe {
-				value, _, getErr := lk.ck.Get(lk.key)
-				if getErr == rpc.OK && value == lk.value {
-					lk.version = 1
-					return // lock acquired
-				}
-			}
+	if err == rpc.ErrNoKey || value == "released" {
+		if err == rpc.ErrNoKey {
+			version = 0
+		}
+		if putErr := lk.ck.Put(lk.key, lk.value, version); putErr != rpc.OK {
 			time.Sleep(time.Millisecond * 10)
 			lk.Acquire()
-		} else {
-			lk.version = 1
 			return
 		}
-	} else if value == "released" {
-		if putErr := lk.ck.Put(lk.key, lk.value, version); putErr != rpc.OK {
-			if putErr == rpc.ErrMaybe {
-				value, _, getErr := lk.ck.Get(lk.key)
-				if getErr == rpc.OK && value == lk.value {
-					lk.version = version + 1
-					return // lock acquired
-				}
-			}
-			time.Sleep(time.Millisecond * 10)
-			lk.Acquire()
-		} else {
-			lk.version = version + 1
-		}
+		lk.version = version + 1
+		return
+	} else if value == lk.value {
+		lk.version = version
+		return
 	} else {
 		time.Sleep(time.Millisecond * 10)
 		lk.Acquire()

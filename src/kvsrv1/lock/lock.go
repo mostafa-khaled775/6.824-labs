@@ -66,5 +66,7 @@ func (lk *Lock) Acquire() {
 }
 
 func (lk *Lock) Release() {
+	// we do not to check for the error here since
+	// we are the only one who can release the lock
 	lk.ck.Put(lk.key, "released", lk.version)
 }

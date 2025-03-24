@@ -33,7 +33,6 @@ import (
 const heartBeatDelay = 100
 const timeoutDelayMin = 110
 const timeoutDelayRng = 300
-const verbose = false
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -68,7 +67,6 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -228,12 +226,6 @@ func (rf *Raft) electionTimeout() <-chan time.Time {
 	return time.After(time.Millisecond * time.Duration(ms))
 }
 
-func (rf *Raft) log(args ...any) {
-	if verbose {
-		log.Println(append([]any{rf.id(), ": "}, args)...)
-	}
-}
-
 func (rf *Raft) follower() {
 	select {
 	case <-rf.heartBeats:
@@ -241,21 +233,15 @@ func (rf *Raft) follower() {
 	case <-rf.killed:
 		go rf.halt()
 	case <-rf.electionTimeout():
-		rf.log("timeout: starting a new term")
 		go rf.candidate(<-rf.term + 1)
 	}
 }
 
-func (rf *Raft) closeOnTermChange(term int, ch chan struct{}) {
+func (rf *Raft) onTermChangeFunc(term int, f func()) {
 	termChanged := make(chan int)
 	rf.termUpdateSub <- TermUpdateSub{termChanged, term}
-	select {
-	case <-termChanged:
-		close(ch)
-	case <-rf.heartBeats:
-		close(ch)
-		<-termChanged
-	}
+	<-termChanged
+	f()
 }
 
 func (rf *Raft) sendRequestVote(peer *labrpc.ClientEnd, term int, voteGranted chan<- bool, stop <-chan struct{}) {
@@ -301,20 +287,34 @@ func (rf *Raft) voteCollector(term int, votes chan bool, promote chan<- struct{}
 			close(promote)
 		}
 	}
-	if promoted {
-		rf.log("promoted to leader for term ", term, " with ", votesGranted, " votes")
-	}
 }
 
 func (rf *Raft) candidate(term int) {
+
 	rf.setTerm <- term
 	demote := make(chan struct{})
+	closeDemote := sync.OnceFunc(func() { close(demote) })
 	promote := make(chan struct{})
 	votes := make(chan bool)
 
 	go rf.voteCollector(term, votes, promote)
 
-	go rf.closeOnTermChange(term, demote)
+	go rf.onTermChangeFunc(term, closeDemote)
+
+	// track new leaders
+	go func() {
+		for {
+			select {
+			case <-demote:
+				return
+			case hbTerm := <-rf.heartBeats:
+				if hbTerm >= term {
+					closeDemote()
+					return
+				}
+			}
+		}
+	}()
 
 	for i, peer := range rf.peers {
 		if i == rf.me {
@@ -336,6 +336,15 @@ func (rf *Raft) candidate(term int) {
 }
 
 func (rf *Raft) sendHeartBeats(demoted <-chan struct{}, peer *labrpc.ClientEnd, term int) {
+	sendHB := func() {
+		var reply AppendEntriesReply
+		if ok := peer.Call("Raft.AppendEntries", &AppendEntriesArgs{term}, &reply); ok {
+			if reply.Term > term {
+				rf.setTerm <- reply.Term
+			}
+		}
+	}
+	go sendHB()
 	for {
 		select {
 		case <-demoted:
@@ -343,12 +352,7 @@ func (rf *Raft) sendHeartBeats(demoted <-chan struct{}, peer *labrpc.ClientEnd, 
 		case <-rf.killed:
 			return
 		case <-time.After(time.Millisecond * heartBeatDelay):
-			var reply AppendEntriesReply
-			if ok := peer.Call("Raft.AppendEntries", &AppendEntriesArgs{term}, &reply); ok {
-				if reply.Term > term {
-					rf.setTerm <- reply.Term
-				}
-			}
+			go sendHB()
 		}
 	}
 }
@@ -356,8 +360,8 @@ func (rf *Raft) sendHeartBeats(demoted <-chan struct{}, peer *labrpc.ClientEnd, 
 func (rf *Raft) leader(term int) {
 	demote := make(chan struct{})
 	rf.isLeader.Store(true)
-	defer rf.isLeader.Store(false)
-	go rf.closeOnTermChange(term, demote)
+
+	go rf.onTermChangeFunc(term, func() { close(demote) })
 
 	// start heartbeat go-routines
 	for i, peer := range rf.peers {
@@ -368,8 +372,10 @@ func (rf *Raft) leader(term int) {
 	}
 	select {
 	case <-rf.killed:
+		rf.isLeader.Store(false)
 		go rf.halt()
 	case <-demote:
+		rf.isLeader.Store(false)
 		go rf.follower()
 	}
 }

@@ -19,6 +19,8 @@ package raft
 
 import (
 	//	"bytes"
+	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,9 @@ import (
 	"6.5840/labrpc"
 )
 
+const heartBeatDelay = 100
+const timeoutDelayMin = 110
+const timeoutDelayRng = 300
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -50,28 +55,44 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type VoteRequest struct {
+	term    int
+	id      int
+	granted chan<- bool
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	term          <-chan int
+	setTerm       chan<- int
+	termUpdateSub chan<- TermUpdateSub
+	voteRequests  chan<- VoteRequest
+	kill          context.CancelFunc
+	isLeader      atomic.Bool
 
+	heartBeats chan int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	return <-rf.term, rf.isLeader.Load()
+}
 
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+func (rf *Raft) goForEachPeer(f func(*labrpc.ClientEnd)) {
+	for i, peer := range rf.peers {
+		if i != rf.me {
+			go f(peer)
+		}
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -91,7 +112,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -113,7 +133,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -123,56 +142,131 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term     int
+	ServerId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
+	curTerm := <-rf.term
+	if args.Term > curTerm {
+		rf.setTerm <- args.Term
+	}
+	granted := make(chan bool)
+	rf.voteRequests <- VoteRequest{args.Term, args.ServerId, granted}
+	reply.VoteGranted = <-granted
+	reply.Term = <-rf.term
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) CallRequestVote(peer *labrpc.ClientEnd, args RequestVoteArgs) bool {
+	var reply RequestVoteReply
+	if ok := peer.Call("Raft.RequestVote", &args, &reply); ok {
+		if reply.Term > args.Term {
+			rf.setTerm <- reply.Term
+		}
+	}
+	return reply.VoteGranted
 }
 
+type AppendEntriesArgs struct {
+	Term int
+}
+type AppendEntriesReply struct {
+	Term int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	term := <-rf.term
+	rf.setTerm <- args.Term
+	if args.Term >= term {
+		rf.heartBeats <- args.Term
+	}
+	reply.Term = max(args.Term, term)
+}
+
+func (rf *Raft) CallAppendEntries(peer *labrpc.ClientEnd, args AppendEntriesArgs) {
+	var reply AppendEntriesReply
+	if ok := peer.Call("Raft.AppendEntries", &args, &reply); ok {
+		if reply.Term > args.Term {
+			rf.setTerm <- reply.Term
+		}
+	}
+}
+
+type LogEntry struct {
+	term int
+}
+
+type TermUpdateSub struct {
+	ch        chan<- int
+	firstTerm int
+}
+
+func termTracker(ctx context.Context, termUpdateSub <-chan TermUpdateSub, getTerm chan<- int, setTerm <-chan int) {
+	term := 0
+	subs := []chan<- int{}
+	for {
+		select {
+		case sub := <-termUpdateSub:
+			if sub.firstTerm < term {
+				sub.ch <- term
+				close(sub.ch)
+			} else {
+				subs = append(subs, sub.ch)
+			}
+		case getTerm <- term:
+		case newTerm := <-setTerm:
+			if newTerm <= term {
+				continue
+			}
+			term = newTerm
+			capturedSubs := subs
+			subs = []chan<- int{}
+			go func() {
+				for _, s := range capturedSubs {
+					s <- newTerm
+					close(s)
+				}
+			}()
+		case <-ctx.Done():
+			close(getTerm)
+			return
+		}
+	}
+}
+
+func (rf *Raft) id() string {
+	return fmt.Sprintf("Raft-%d", rf.me)
+}
+
+func (rf *Raft) electionTimeout() <-chan time.Time {
+	ms := timeoutDelayMin + (rand.Int63() % timeoutDelayRng)
+	return time.After(time.Millisecond * time.Duration(ms))
+}
+
+type state func(context.Context) state
+
+func (rf *Raft) onTermChange(ctx context.Context, term int) (context.Context, context.CancelFunc) {
+	c, cancel := context.WithCancel(ctx)
+	go func() {
+		termChanged := make(chan int)
+		rf.termUpdateSub <- TermUpdateSub{termChanged, term}
+		<-termChanged
+		cancel()
+	}()
+	return c, cancel
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -193,41 +287,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-}
-
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
-}
-
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
+	rf.kill()
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -248,12 +312,33 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 
+	term := make(chan int)
+	rf.term = term
+	termUpdateSub := make(chan TermUpdateSub)
+	rf.termUpdateSub = termUpdateSub
+	voteRequests := make(chan VoteRequest)
+	rf.voteRequests = voteRequests
+	setTerm := make(chan int)
+	rf.setTerm = setTerm
+	rf.heartBeats = make(chan int)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
-
-
+	ctx, cancel := context.WithCancel(context.Background())
+	rf.kill = cancel
+	go voter(ctx, rf.term, voteRequests)
+	go termTracker(ctx, termUpdateSub, term, setTerm)
+	go func() {
+		state := rf.follower
+		for {
+			select {
+			case <-ctx.Done():
+				break
+			default:
+				state = state(ctx)
+			}
+		}
+	}()
 	return rf
 }
